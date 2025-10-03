@@ -1,191 +1,211 @@
 import Foundation
-import AVFoundation
 import Speech
-import React
+import AVFoundation
 
-@objc(VoiceWithRecordingModule)
-class VoiceWithRecordingModule: RCTEventEmitter {
+@objc(VoiceWithRecording)
+class VoiceWithRecording: RCTEventEmitter {
     
-    private var audioEngine: AVAudioEngine?
     private var speechRecognizer: SFSpeechRecognizer?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var audioEngine = AVAudioEngine()
     private var audioFile: AVAudioFile?
     private var isRecording = false
     
     override init() {
         super.init()
-        speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        // *** CONFIGURATION POUR LE FRANÇAIS ***
+        let frenchLocale = Locale(identifier: "fr-FR")
+        speechRecognizer = SFSpeechRecognizer(locale: frenchLocale)
     }
     
     override func supportedEvents() -> [String]! {
-        return ["onTranscript"]
+        return ["onTranscript", "onPartialTranscript", "onError", "onReadyForSpeech", "onEndOfSpeech"]
     }
     
     @objc
-    func startVoiceRecording(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+    func startVoiceRecording(_ resolve: @escaping RCTPromiseResolveBlock,
+                            rejecter reject: @escaping RCTPromiseRejectBlock) {
+        
+        // Vérifier si déjà en cours d'enregistrement
         if isRecording {
-            reject("ALREADY_RECORDING", "Voice recording is already in progress", nil)
+            reject("ALREADY_RECORDING", "Recording already in progress", nil)
             return
         }
         
-        // Request permissions
-        requestPermissions { [weak self] granted in
-            guard let self = self else { return }
-            
-            if !granted {
-                reject("PERMISSION_DENIED", "Microphone and speech recognition permissions are required", nil)
+        // Vérifier les permissions
+        checkPermissions { [weak self] granted in
+            guard granted else {
+                reject("PERMISSION_DENIED", "Speech recognition or microphone permission denied", nil)
                 return
             }
             
-            DispatchQueue.main.async {
-                self.setupAudioSession()
-                self.startRecording(resolve: resolve, rejecter: reject)
+            guard let self = self else { return }
+            
+            // Vérifier la disponibilité de la reconnaissance vocale
+            guard let speechRecognizer = self.speechRecognizer, speechRecognizer.isAvailable else {
+                reject("SPEECH_NOT_AVAILABLE", "Speech recognition not available for French", nil)
+                return
+            }
+            
+            do {
+                try self.startRecordingSession()
+                self.isRecording = true
+                resolve(nil)
+            } catch {
+                reject("AUDIO_INIT_ERROR", "Failed to start recording: \(error.localizedDescription)", error)
             }
         }
     }
     
-    @objc
-    func stopVoiceRecording(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
-        if !isRecording {
-            reject("NOT_RECORDING", "No voice recording in progress", nil)
-            return
+    private func checkPermissions(completion: @escaping (Bool) -> Void) {
+        // Vérifier la permission de reconnaissance vocale
+        SFSpeechRecognizer.requestAuthorization { authStatus in
+            DispatchQueue.main.async {
+                guard authStatus == .authorized else {
+                    completion(false)
+                    return
+                }
+                
+                // Vérifier la permission du microphone
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    completion(granted)
+                }
+            }
         }
-        
-        isRecording = false
-        
-        // Stop audio engine
-        audioEngine?.stop()
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        
-        // Stop recognition task
+    }
+    
+    private func startRecordingSession() throws {
+        // Annuler toute tâche en cours
         recognitionTask?.cancel()
         recognitionTask = nil
-        recognitionRequest?.endAudio()
-        recognitionRequest = nil
         
-        // Finalize audio file
-        audioFile = nil
+        // Configurer la session audio
+        let audioSession = AVAudioSession.sharedInstance()
+        try audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         
-        // Get the file path
-        let documentsPath = NSTemporaryDirectory()
-        let audioFilePath = (documentsPath as NSString).appendingPathComponent("recorded_audio.wav")
-        
-        resolve(audioFilePath)
-    }
-    
-    private func requestPermissions(completion: @escaping (Bool) -> Void) {
-        let group = DispatchGroup()
-        var microphoneGranted = false
-        var speechGranted = false
-        
-        // Request microphone permission
-        group.enter()
-        AVAudioSession.sharedInstance().requestRecordPermission { granted in
-            microphoneGranted = granted
-            group.leave()
-        }
-        
-        // Request speech recognition permission
-        group.enter()
-        SFSpeechRecognizer.requestAuthorization { status in
-            speechGranted = (status == .authorized)
-            group.leave()
-        }
-        
-        group.notify(queue: .main) {
-            completion(microphoneGranted && speechGranted)
-        }
-    }
-    
-    private func setupAudioSession() {
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.record, mode: .measurement, options: [])
-            try audioSession.setActive(true, options: [])
-        } catch {
-            print("Failed to setup audio session: \(error)")
-        }
-    }
-    
-    private func startRecording(resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
-        guard let speechRecognizer = speechRecognizer, speechRecognizer.isAvailable else {
-            reject("SPEECH_NOT_AVAILABLE", "Speech recognition is not available on this device", nil)
-            return
-        }
-        
-        // Initialize audio engine
-        audioEngine = AVAudioEngine()
-        guard let audioEngine = audioEngine else {
-            reject("AUDIO_INIT_ERROR", "Failed to initialize audio engine", nil)
-            return
-        }
-        
-        // Setup audio file
-        let documentsPath = NSTemporaryDirectory()
-        let audioFilePath = (documentsPath as NSString).appendingPathComponent("recorded_audio.wav")
-        let audioFileURL = URL(fileURLWithPath: audioFilePath)
-        
-        let audioFormat = audioEngine.inputNode.outputFormat(forBus: 0)
-        
-        do {
-            audioFile = try AVAudioFile(forWriting: audioFileURL, settings: audioFormat.settings)
-        } catch {
-            reject("FILE_ERROR", "Failed to create audio file: \(error.localizedDescription)", error)
-            return
-        }
-        
-        // Setup recognition request
+        // Créer la requête de reconnaissance
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        
         guard let recognitionRequest = recognitionRequest else {
-            reject("RECOGNITION_ERROR", "Failed to create recognition request", nil)
-            return
+            throw NSError(domain: "VoiceWithRecording", code: -1, 
+                         userInfo: [NSLocalizedDescriptionKey: "Unable to create recognition request"])
         }
         
         recognitionRequest.shouldReportPartialResults = true
         
-        // Install tap on input node
-        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 1024, format: audioFormat) { [weak self] buffer, _ in
+        // *** CONFIGURATION FRANÇAISE ADDITIONNELLE ***
+        if #available(iOS 13, *) {
+            recognitionRequest.requiresOnDeviceRecognition = false
+        }
+        
+        // Configurer le moteur audio
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        
+        // Préparer le fichier pour l'enregistrement
+        let audioFilePath = NSTemporaryDirectory() + "recorded_audio.wav"
+        let audioFileURL = URL(fileURLWithPath: audioFilePath)
+        
+        // Supprimer le fichier existant s'il y en a un
+        try? FileManager.default.removeItem(at: audioFileURL)
+        
+        audioFile = try AVAudioFile(forWriting: audioFileURL,
+                                   settings: recordingFormat.settings,
+                                   commonFormat: recordingFormat.commonFormat,
+                                   interleaved: recordingFormat.isInterleaved)
+        
+        // Installer le tap pour capturer l'audio
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             guard let self = self else { return }
             
-            // Write to audio file
+            // Envoyer le buffer à la reconnaissance vocale
+            self.recognitionRequest?.append(buffer)
+            
+            // Écrire dans le fichier
             do {
                 try self.audioFile?.write(from: buffer)
             } catch {
-                print("Error writing to audio file: \(error)")
+                print("Error writing audio buffer: \(error)")
             }
-            
-            // Send to speech recognizer
-            self.recognitionRequest?.append(buffer)
         }
         
-        // Start recognition task
-        recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
+        // Démarrer le moteur audio
+        audioEngine.prepare()
+        try audioEngine.start()
+        
+        // Envoyer l'événement "prêt"
+        sendEvent(withName: "onReadyForSpeech", body: nil)
+        
+        // Démarrer la reconnaissance vocale
+        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             guard let self = self else { return }
             
             if let error = error {
-                print("Speech recognition error: \(error)")
+                self.sendEvent(withName: "onError", body: ["error": error.localizedDescription])
                 return
             }
             
-            if let result = result, result.isFinal {
-                let transcript = result.bestTranscription.formattedString
-                self.sendTranscriptEvent(transcript)
+            if let result = result {
+                let transcription = result.bestTranscription.formattedString
+                
+                if result.isFinal {
+                    self.sendEvent(withName: "onTranscript", 
+                                 body: ["transcription": transcription])
+                    self.sendEvent(withName: "onEndOfSpeech", body: nil)
+                } else {
+                    self.sendEvent(withName: "onPartialTranscript",
+                                 body: ["transcription": transcription, "isFinal": false])
+                }
             }
-        }
-        
-        // Start audio engine
-        do {
-            try audioEngine.start()
-            isRecording = true
-            resolve(nil)
-        } catch {
-            reject("START_ERROR", "Failed to start audio engine: \(error.localizedDescription)", error)
         }
     }
     
-    private func sendTranscriptEvent(_ transcript: String) {
-        let body: [String: Any] = ["text": transcript]
-        sendEvent(withName: "onTranscript", body: body)
+    @objc
+    func stopVoiceRecording(_ resolve: @escaping RCTPromiseResolveBlock,
+                           rejecter reject: @escaping RCTPromiseRejectBlock) {
+        
+        if !isRecording {
+            reject("NOT_RECORDING", "No recording in progress", nil)
+            return
+        }
+        
+        // Arrêter l'enregistrement
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
+        
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        
+        recognitionRequest = nil
+        recognitionTask = nil
+        
+        isRecording = false
+        
+        // Retourner le chemin du fichier
+        let audioFilePath = NSTemporaryDirectory() + "recorded_audio.wav"
+        resolve(audioFilePath)
     }
-} 
+    
+    @objc
+    override static func requiresMainQueueSetup() -> Bool {
+        return true
+    }
+}
+
+// Fichier Bridge Objective-C (VoiceWithRecording.m)
+/*
+#import <React/RCTBridgeModule.h>
+#import <React/RCTEventEmitter.h>
+
+@interface RCT_EXTERN_MODULE(VoiceWithRecording, RCTEventEmitter)
+
+RCT_EXTERN_METHOD(startVoiceRecording:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
+RCT_EXTERN_METHOD(stopVoiceRecording:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
+@end
+*/
